@@ -1,0 +1,477 @@
+<!doctype html>
+<!--
+  ===================================================================
+  Walk Up Songs — every player in the app, and what they walk up to.
+  ===================================================================
+
+  Where the data comes from
+  -------------------------
+  data.js is generated from the All Live Baseball app, so there is one
+  list rather than two drifting apart. Regenerate it whenever the rosters
+  there change. It holds three things:
+
+      teams    team -> the players on it
+      songs    player -> the song they use now
+      history  player -> every song their team page has listed, with the
+               date it was logged (only players with more than one)
+
+  A player missing from `songs` shows as IDK. That isn't an oversight —
+  their own team's page said "No songs available", which is usually
+  because they're on the injured list or in the minors and so never come
+  to the plate.
+
+  Playing a song
+  --------------
+  The recordings themselves can't be embedded, but Apple's search returns
+  a free 30-second preview for most tracks. We ask for one by title and
+  artist and play that. It's fetched with a <script> tag rather than a
+  normal request because that endpoint doesn't allow ordinary
+  cross-site calls — see preview() for the detail.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Walk Up Songs</title>
+<meta name="description" content="Every player's walk-up song — search, browse and play a preview.">
+<style>
+  /* Same family look as the other apps here. */
+  *, *::before, *::after { box-sizing: border-box; }
+  :root {
+    --bg: #f4f6fb; --bg-glow: #dfe7f7;
+    --card: #ffffff; --card-edge: #dde3ee;
+    --ink: #131826; --ink-dim: #5c6577;
+    --accent: #2f6df6; --idk: #b4690e; --good: #1a9c5b;
+    --shadow: 0 1px 2px rgba(16,24,40,.06), 0 8px 24px rgba(16,24,40,.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b1220; --bg-glow: #14203a;
+      --card: #151d2e; --card-edge: #26314a;
+      --ink: #eef2fb; --ink-dim: #96a1b8;
+      --accent: #6f9bff; --idk: #e8b25f; --good: #3ecf8e;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+    }
+  }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    padding: clamp(1.1rem, 4vw, 2.2rem) clamp(.8rem, 4vw, 2rem) 6rem;
+    min-height: 100vh;
+    font-family: ui-rounded, "SF Pro Rounded", -apple-system, BlinkMacSystemFont,
+                 "Segoe UI", Roboto, system-ui, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+    background-image: radial-gradient(120% 80% at 50% -10%, var(--bg-glow) 0%, var(--bg) 60%);
+    background-attachment: fixed;
+  }
+  .wrap { max-width: 50rem; margin: 0 auto; }
+  [hidden] { display: none !important; }
+
+  header { text-align: center; margin-bottom: 1.1rem; }
+  h1 { margin: 0 0 .3rem; font-size: clamp(1.7rem, 6vw, 2.4rem); letter-spacing: -.02em; }
+  .tagline { margin: 0; color: var(--ink-dim); font-size: clamp(.88rem, 2.4vw, 1rem); }
+
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 1.1rem; box-shadow: var(--shadow);
+    padding: 1rem; margin-bottom: .9rem;
+  }
+
+  .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+  .spacer { margin-left: auto; }
+
+  input[type=text], select {
+    font: inherit; padding: .6rem .8rem; border-radius: .75rem;
+    border: 1px solid var(--card-edge); background: var(--bg); color: var(--ink);
+    min-width: 0;
+  }
+  input[type=text] { flex: 1; }
+  input[type=text]:focus, select:focus { outline: none; border-color: var(--accent); }
+
+  button {
+    font: inherit; font-size: .9rem;
+    padding: .45rem .8rem; border-radius: .7rem;
+    border: 1px solid var(--card-edge); background: var(--bg); color: var(--ink);
+    cursor: pointer; transition: border-color .15s ease, transform .1s ease;
+  }
+  button:hover { border-color: var(--accent); }
+  button:active { transform: translateY(1px); }
+  button.on { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 650; }
+
+  .msg { color: var(--ink-dim); font-size: .85rem; line-height: 1.5; }
+
+  /* ---- one player ------------------------------------------------------ */
+  .p {
+    display: flex; align-items: center; gap: .7rem;
+    padding: .6rem .3rem; border-bottom: 1px solid var(--card-edge);
+  }
+  .p:last-child { border-bottom: none; }
+  .play {
+    width: 2.2rem; height: 2.2rem; flex: none; padding: 0;
+    border-radius: 50%; display: grid; place-items: center; font-size: .9rem;
+  }
+  .play.playing { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .play:disabled { opacity: .3; }
+  .who { flex: 1; min-width: 0; }
+  .nm { font-weight: 600; font-size: .95rem; }
+  .sng { font-size: .84rem; color: var(--ink-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sng.idk { color: var(--idk); font-weight: 650; }
+  .tm { font-size: .74rem; color: var(--ink-dim); flex: none; text-align: right; max-width: 8rem;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .past {
+    font-size: .74rem; color: var(--accent); background: none; border: none;
+    padding: .1rem .3rem; cursor: pointer; flex: none;
+  }
+  .hist { padding: .2rem .3rem .7rem 3rem; }
+  .hist div { font-size: .82rem; color: var(--ink-dim); padding: .18rem 0; display: flex; gap: .5rem; }
+  .hist .yr { color: var(--accent); font-variant-numeric: tabular-nums; flex: none; width: 3rem; }
+
+  .teamhead {
+    font-size: .76rem; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--ink-dim); font-weight: 700; padding: .9rem .3rem .4rem;
+    border-bottom: 1px solid var(--card-edge);
+  }
+  .none { text-align: center; color: var(--ink-dim); padding: 1.6rem 0; font-size: .9rem; }
+
+  /* what's playing, pinned to the bottom */
+  .bar {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+    background: var(--card); border-top: 1px solid var(--card-edge);
+    padding: .6rem clamp(.8rem, 4vw, 2rem);
+    display: flex; align-items: center; gap: .7rem;
+    box-shadow: 0 -4px 20px rgba(0,0,0,.10);
+  }
+  .bar .t { flex: 1; min-width: 0; font-size: .86rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar .t b { display: block; font-size: .8rem; color: var(--ink-dim); font-weight: 400; }
+
+  /* Time left in the preview. Tabular numerals so the countdown doesn't
+     jiggle the layout as the digits change. */
+  .bar .left {
+    flex: none; font-size: 1rem; font-weight: 650;
+    font-variant-numeric: tabular-nums;
+    color: var(--accent); min-width: 2.9rem; text-align: right;
+  }
+  /* The last five seconds go amber, as a heads-up that it's about to end. */
+  .bar .left.soon { color: var(--idk); }
+
+  /* A thin line along the top of the bar that empties as the song plays. */
+  .bar .prog {
+    position: absolute; left: 0; top: -1px; height: 2px;
+    background: var(--accent); width: 0;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .bar .prog { transition: width .25s linear; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>🎵 Walk Up Songs</h1>
+    <p class="tagline" id="tagline">Every player in the app, and what they walk up to.</p>
+  </header>
+
+  <div class="card">
+    <div class="row">
+      <input type="text" id="q" placeholder="Search a name, a song or an artist…" autocomplete="off">
+      <select id="team"><option value="">All teams</option></select>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <button data-filter="all" class="on">Everyone</button>
+      <button data-filter="known">Has a song</button>
+      <button data-filter="idk">IDK</button>
+      <span class="spacer"></span>
+      <span class="msg" id="count"></span>
+    </div>
+  </div>
+
+  <div class="card"><div id="list"></div></div>
+
+  <p class="msg" style="text-align:center">
+    Songs play as a 30-second preview. IDK means their team's own page had nothing on record —
+    usually because they're injured or in the minors.
+  </p>
+
+</div>
+
+<!-- Only on screen while something is actually playing. -->
+<div class="bar" id="bar" hidden>
+  <div class="prog" id="prog"></div>
+  <button id="stop" class="play playing">■</button>
+  <div class="t"><span id="nowT"></span><b id="nowW"></b></div>
+  <span class="left" id="left" aria-live="off"></span>
+</div>
+
+<script src="data.js"></script>
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+
+/* ---------------------------------------------------------------------
+ * Flatten the data into one list of players, since almost everything
+ * here is a search across all of them rather than a walk down one team.
+ * ------------------------------------------------------------------- */
+const PLAYERS = [];
+for (const team in DATA.teams) {
+  for (const name of DATA.teams[team]) {
+    PLAYERS.push({
+      name,
+      team,
+      song: DATA.songs[name] || "",          // "" means nobody knows
+      history: DATA.history[name] || [],
+    });
+  }
+}
+/* Teams alphabetically, and players alphabetically inside each one. The
+   browse view walks this list in order and starts a new heading whenever
+   the team changes, so it has to be sorted by team FIRST — sorted by name
+   alone, the headings would repeat all the way down the page. */
+PLAYERS.sort((a, b) =>
+  a.team.localeCompare(b.team) || a.name.localeCompare(b.name));
+
+const known = PLAYERS.filter((p) => p.song).length;
+$("tagline").textContent =
+  PLAYERS.length + " players · " + known + " with a song · " + (PLAYERS.length - known) + " IDK";
+
+// Team dropdown, biggest rosters are still listed alphabetically.
+for (const team of Object.keys(DATA.teams).sort()) {
+  const o = document.createElement("option");
+  o.value = o.textContent = team;
+  $("team").appendChild(o);
+}
+
+let filter = "all";
+let openHistory = null;      // which player's past songs are showing
+
+/* ---------------------------------------------------------------------
+ * Drawing the list
+ * ------------------------------------------------------------------- */
+function render() {
+  const q = $("q").value.trim().toLowerCase();
+  const team = $("team").value;
+
+  const hits = PLAYERS.filter((p) => {
+    if (team && p.team !== team) return false;
+    if (filter === "known" && !p.song) return false;
+    if (filter === "idk" && p.song) return false;
+    if (!q) return true;
+    // Searching covers the song and artist too, so "Drake" finds everyone
+    // who walks up to one of his.
+    return p.name.toLowerCase().includes(q) || p.song.toLowerCase().includes(q);
+  });
+
+  $("count").textContent = hits.length + (hits.length === 1 ? " player" : " players");
+
+  const list = $("list");
+  list.innerHTML = "";
+  if (!hits.length) {
+    list.innerHTML = '<div class="none">Nobody matches that.</div>';
+    return;
+  }
+
+  /* Group under team headings, but only when you're browsing. Once you've
+     searched, one flat list ordered by name is easier to scan. */
+  const grouped = !q && !team;
+  let lastTeam = null;
+
+  // Searching gives one flat list, so order it by name — team order only
+  // matters while you're browsing under the headings.
+  if (!grouped) hits.sort((a, b) => a.name.localeCompare(b.name));
+
+  // A long unfiltered list is slow to build and pointless to scroll, so
+  // show the first 300 and say what's hidden rather than silently cutting.
+  const CAP = 300;
+  for (const p of hits.slice(0, CAP)) {
+    if (grouped && p.team !== lastTeam) {
+      lastTeam = p.team;
+      const h = document.createElement("div");
+      h.className = "teamhead";
+      h.textContent = p.team;
+      list.appendChild(h);
+    }
+    list.appendChild(rowFor(p));
+    if (openHistory === p.name && p.history.length) list.appendChild(historyFor(p));
+  }
+  if (hits.length > CAP) {
+    const more = document.createElement("div");
+    more.className = "none";
+    more.textContent = (hits.length - CAP) + " more — search or pick a team to narrow it down.";
+    list.appendChild(more);
+  }
+}
+
+function rowFor(p) {
+  const row = document.createElement("div");
+  row.className = "p";
+  row.innerHTML =
+    '<button class="play" title="Play a preview">▶</button>' +
+    '<span class="who"><span class="nm"></span><span class="sng"></span></span>' +
+    '<button class="past" hidden></button>' +
+    '<span class="tm"></span>';
+
+  row.querySelector(".nm").textContent = p.name;
+  const s = row.querySelector(".sng");
+  s.textContent = p.song || "IDK";
+  if (!p.song) s.classList.add("idk");
+  row.querySelector(".tm").textContent = p.team;
+
+  const play = row.querySelector(".play");
+  play.disabled = !p.song;                       // nothing to play for an IDK
+  if (nowPlaying === p.name) play.classList.add("playing");
+  play.onclick = () => (nowPlaying === p.name ? stop() : start(p));
+
+  // Only offer past songs to the players who actually have any.
+  if (p.history.length > 1) {
+    const b = row.querySelector(".past");
+    b.hidden = false;
+    b.textContent = openHistory === p.name ? "hide" : p.history.length + " before";
+    b.onclick = () => { openHistory = openHistory === p.name ? null : p.name; render(); };
+  }
+  return row;
+}
+
+/* The songs they used before, newest first, labelled by year. */
+function historyFor(p) {
+  const box = document.createElement("div");
+  box.className = "hist";
+  for (const h of p.history) {
+    const line = document.createElement("div");
+    const yr = (h.d || "").split("/").pop() || "—";
+    line.innerHTML = '<span class="yr"></span><span class="s"></span>';
+    line.querySelector(".yr").textContent = yr;
+    line.querySelector(".s").textContent = h.a ? h.t + " — " + h.a : h.t;
+    line.style.cursor = "pointer";
+    line.onclick = () => start({ name: p.name, song: h.a ? h.t + " — " + h.a : h.t });
+    box.appendChild(line);
+  }
+  return box;
+}
+
+/* ===================================================================== *
+ * Playing a preview
+ * ---------------------------------------------------------------------
+ * Apple's search will hand back a free 30-second preview for most tracks,
+ * but it doesn't allow ordinary cross-site requests — a normal fetch is
+ * refused. It does support the older trick of being loaded as a <script>
+ * that calls a function we name in the URL, so that's what happens here:
+ * we plant a callback, load the script, and it calls us back with the
+ * result. Cleaned up either way, including if it never answers.
+ * ===================================================================== */
+let jsonpN = 0;
+function preview(query, cb) {
+  const id = "cb" + (++jsonpN);
+  const s = document.createElement("script");
+  let done = false;
+  const finish = (url) => {
+    if (done) return;
+    done = true;
+    try { delete window[id]; } catch (e) { }
+    s.remove();
+    cb(url);
+  };
+  window[id] = (data) => {
+    const r = data && data.results && data.results[0];
+    finish(r ? r.previewUrl : null);
+  };
+  s.onerror = () => finish(null);
+  s.src = "https://itunes.apple.com/search?media=music&entity=song&limit=1&callback=" +
+          id + "&term=" + encodeURIComponent(query);
+  document.head.appendChild(s);
+  setTimeout(() => finish(null), 6000);        // give up if it never answers
+}
+
+let audio = null;
+let nowPlaying = null;
+let seq = 0;                                   // guards against a slow lookup landing late
+
+/* ---------------------------------------------------------------------
+ * The countdown
+ * ---------------------------------------------------------------------
+ * Shows how long is left in the preview, on screen only — it is never
+ * spoken, and the element is marked aria-live="off" so a screen reader
+ * won't read the numbers out as they tick either.
+ *
+ * The time comes from the audio itself rather than a timer of our own, so
+ * it stays honest if the track stalls to buffer. Previews are usually 30
+ * seconds but not always, so nothing here assumes a length.
+ * ------------------------------------------------------------------- */
+function clock(secs) {
+  secs = Math.max(0, Math.ceil(secs));
+  return Math.floor(secs / 60) + ":" + String(secs % 60).padStart(2, "0");
+}
+
+function tick() {
+  const total = audio ? audio.duration : 0;
+  // duration is NaN until enough of the file has loaded to know it.
+  if (!audio || !isFinite(total) || !total) return;
+  const left = total - audio.currentTime;
+  $("left").textContent = clock(left);
+  $("left").classList.toggle("soon", left <= 5);
+  $("prog").style.width = (100 * (audio.currentTime / total)) + "%";
+}
+
+function clearClock() {
+  $("left").textContent = "";
+  $("left").classList.remove("soon");
+  $("prog").style.width = "0%";
+}
+
+function start(p) {
+  const wanted = ++seq;
+  nowPlaying = p.name;
+  $("bar").hidden = false;
+  $("nowT").textContent = p.song;
+  $("nowW").textContent = p.name + " · finding it…";
+  clearClock();                                // no stale time from the last song
+  render();
+
+  // The em dash is ours, not part of the title — the search does better without it.
+  preview(p.song.replace(/ — /g, " "), (url) => {
+    if (wanted !== seq) return;                // you clicked something else meanwhile
+    if (!url) {
+      $("nowW").textContent = p.name + " · no preview found for this one";
+      nowPlaying = null;
+      render();
+      return;
+    }
+    if (!audio) audio = new Audio();
+    audio.src = url;
+    audio.volume = 0.8;
+    audio.onended = stop;
+    // timeupdate fires a few times a second while playing; loadedmetadata is
+    // what first tells us how long the preview actually is.
+    audio.ontimeupdate = tick;
+    audio.onloadedmetadata = tick;
+    const go = audio.play();
+    if (go && go.catch) go.catch(() => { $("nowW").textContent = p.name + " · tap play again"; });
+    $("nowW").textContent = p.name + " · 30 second preview";
+  });
+}
+
+function stop() {
+  seq++;                                       // cancels anything still being looked up
+  if (audio) { try { audio.pause(); } catch (e) { } }
+  nowPlaying = null;
+  $("bar").hidden = true;
+  clearClock();
+  render();
+}
+
+$("stop").onclick = stop;
+$("q").oninput = render;
+$("team").onchange = render;
+document.querySelectorAll("[data-filter]").forEach((b) => {
+  b.onclick = () => {
+    document.querySelectorAll("[data-filter]").forEach((x) => x.classList.toggle("on", x === b));
+    filter = b.dataset.filter;
+    render();
+  };
+});
+
+render();
+</script>
+</body>
+</html>
