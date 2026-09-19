@@ -24,9 +24,28 @@
   --------------
   The recordings themselves can't be embedded, but Apple's search returns
   a free 30-second preview for most tracks. We ask for one by title and
-  artist and play that. It's fetched with a <script> tag rather than a
-  normal request because that endpoint doesn't allow ordinary
-  cross-site calls — see preview() for the detail.
+  artist and play that. Apple's search leaves out explicit tracks, though,
+  and plenty of walk-up songs are explicit ("Pepas", "The Box"), so when
+  Apple doesn't have it we ask Deezer, which does. Both are fetched with a
+  <script> tag rather than a normal request because neither allows
+  ordinary cross-site calls — see preview() for the detail.
+
+  Safari, and every browser on an iPhone or iPad, will only start sound
+  from inside the tap itself — and the lookup answers too late for that.
+  So the tap starts a sliver of silence on the player straight away, and
+  the preview is swapped onto that same, already-started player when it
+  arrives. See unlock().
+
+  💎 Premium
+  ----------
+  With Premium (the shared arcade store, bought from the bottom bar), the
+  list becomes every player who has appeared in the majors this season,
+  each under the team they're with now. That comes live from MLB's own
+  public stats site (statsapi.mlb.com), which allows calls from any page,
+  so it's always up to date with trades and call-ups without regenerating
+  anything. Songs still come from data.js, matched up by name. Anyone in
+  data.js who hasn't played this year (injured all season, usually) stays
+  in the list under their data.js team, so Premium never shows fewer.
 -->
 <html lang="en">
 <head>
@@ -71,6 +90,7 @@
   header { text-align: center; margin-bottom: 1.1rem; }
   h1 { margin: 0 0 .3rem; font-size: clamp(1.7rem, 6vw, 2.4rem); letter-spacing: -.02em; }
   .tagline { margin: 0; color: var(--ink-dim); font-size: clamp(.88rem, 2.4vw, 1rem); }
+  #prem { margin: .35rem 0 0; }
 
   .card {
     background: var(--card); border: 1px solid var(--card-edge);
@@ -114,6 +134,8 @@
   .play.playing { background: var(--accent); border-color: var(--accent); color: #fff; }
   .play:disabled { opacity: .3; }
   .who { flex: 1; min-width: 0; }
+  /* Name over song. They're spans, so block them or they run together. */
+  .nm, .sng { display: block; }
   .nm { font-weight: 600; font-size: .95rem; }
   .sng { font-size: .84rem; color: var(--ink-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sng.idk { color: var(--idk); font-weight: 650; }
@@ -171,6 +193,7 @@
   <header>
     <h1>🎵 Walk Up Songs</h1>
     <p class="tagline" id="tagline">Every player in the app, and what they walk up to.</p>
+    <p class="msg" id="prem"></p>
   </header>
 
   <div class="card">
@@ -213,34 +236,126 @@ const $ = (id) => document.getElementById(id);
 /* ---------------------------------------------------------------------
  * Flatten the data into one list of players, since almost everything
  * here is a search across all of them rather than a walk down one team.
+ * With 💎 Premium it's MLB's full list for the season instead (below).
  * ------------------------------------------------------------------- */
-const PLAYERS = [];
-for (const team in DATA.teams) {
-  for (const name of DATA.teams[team]) {
-    PLAYERS.push({
-      name,
-      team,
-      song: DATA.songs[name] || "",          // "" means nobody knows
-      history: DATA.history[name] || [],
-    });
-  }
+// The shared arcade Premium check — the same line in every arcade app.
+function isPremium(){ try { return +localStorage.getItem('squarebox:premiumUntil') > Date.now(); } catch(e){ return false; } }
+
+// Accents, dots and dashes stripped, for comparing names across sources.
+const plain = (s) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+// Players also lose Jr./II, since the two lists don't always agree on them.
+const nameKey = (s) => plain(s.replace(/\b(jr|sr|ii|iii|iv)\b/gi, ""));
+
+let PLAYERS = [];
+let season = null;             // MLB's list once it's in: [{ name, team }]
+let seasonState = "";          // "loading" / "failed" while it isn't
+
+// ours = false for someone only MLB knows, who has no song on record even
+// if they share a name with someone who does.
+function player(name, team, ours = true) {
+  return {
+    name,
+    team,
+    song: (ours && DATA.songs[name]) || "",  // "" means nobody knows
+    history: (ours && DATA.history[name]) || [],
+  };
 }
-/* Teams alphabetically, and players alphabetically inside each one. The
-   browse view walks this list in order and starts a new heading whenever
-   the team changes, so it has to be sorted by team FIRST — sorted by name
-   alone, the headings would repeat all the way down the page. */
-PLAYERS.sort((a, b) =>
-  a.team.localeCompare(b.team) || a.name.localeCompare(b.name));
 
-const known = PLAYERS.filter((p) => p.song).length;
-$("tagline").textContent =
-  PLAYERS.length + " players · " + known + " with a song · " + (PLAYERS.length - known) + " IDK";
+function build() {
+  PLAYERS = [];
+  const ours = [];
+  for (const team in DATA.teams) {
+    for (const name of DATA.teams[team]) ours.push({ name, team });
+  }
 
-// Team dropdown, biggest rosters are still listed alphabetically.
-for (const team of Object.keys(DATA.teams).sort()) {
-  const o = document.createElement("option");
-  o.value = o.textContent = team;
-  $("team").appendChild(o);
+  if (!isPremium() || !season) {
+    for (const o of ours) PLAYERS.push(player(o.name, o.team));
+  } else {
+    /* Line MLB's players up with ours by name, so they keep their songs.
+       A few names are shared by two different players (there are two Max
+       Muncys), so when that happens the song goes to the one on the team
+       data.js has them on. */
+    const mlb = {};
+    for (const m of season) (mlb[nameKey(m.name)] = mlb[nameKey(m.name)] || []).push(m);
+    const same = new Map();                    // MLB entry -> our name for them
+    for (const o of ours) {
+      const all = mlb[nameKey(o.name)];
+      if (!all) continue;
+      const m = all.find((x) => x.team === o.team) || all[0];
+      if (!same.has(m)) same.set(m, o.name);
+    }
+    for (const m of season) PLAYERS.push(same.has(m) ? player(same.get(m), m.team) : player(m.name, m.team, false));
+    // Nobody from data.js goes missing — those who haven't played this
+    // year stay under the team data.js has them on.
+    const used = new Set(same.values());
+    for (const o of ours) if (!used.has(o.name)) PLAYERS.push(player(o.name, o.team));
+  }
+
+  /* Teams alphabetically, and players alphabetically inside each one. The
+     browse view walks this list in order and starts a new heading whenever
+     the team changes, so it has to be sorted by team FIRST — sorted by name
+     alone, the headings would repeat all the way down the page. */
+  PLAYERS.sort((a, b) =>
+    a.team.localeCompare(b.team) || a.name.localeCompare(b.name));
+
+  const known = PLAYERS.filter((p) => p.song).length;
+  $("tagline").textContent =
+    PLAYERS.length + " players · " + known + " with a song · " + (PLAYERS.length - known) + " IDK";
+
+  // Team dropdown, alphabetically. Rebuilt each time since Premium changes
+  // the teams, but whichever one you'd picked stays picked if it's still there.
+  const pick = $("team").value;
+  $("team").length = 1;
+  for (const team of [...new Set(PLAYERS.map((p) => p.team))].sort()) {
+    const o = document.createElement("option");
+    o.value = o.textContent = team;
+    $("team").appendChild(o);
+  }
+  $("team").value = pick;
+  if ($("team").value !== pick) $("team").value = "";
+
+  $("prem").textContent = !isPremium()
+    ? "💎 Premium: see every player who played this season"
+    : seasonState === "loading" ? "💎 Premium: fetching every player who's played this season…"
+    : seasonState === "failed" ? "💎 Premium: couldn't reach MLB just now, so this is the usual list"
+    : "💎 Premium: everyone who's played this season, on their current team";
+}
+
+/* ---------------------------------------------------------------------
+ * 💎 Everyone who has played this season, from MLB's public stats site.
+ * Its season list is the players who have appeared in the majors this
+ * year, and currentTeam is the major-league club they belong to now —
+ * so a traded player shows under his new team. Team ids become names with
+ * a second small call. Both allow calls from any page, file:// included.
+ * ------------------------------------------------------------------- */
+function loadSeason() {
+  if (!isPremium() || season || seasonState === "loading") return;
+  seasonState = "loading";
+  const api = "https://statsapi.mlb.com/api/v1/";
+  const year = new Date().getFullYear();
+  const get = (path) => fetch(api + path).then((r) => {
+    if (!r.ok) throw new Error(r.status);
+    return r.json();
+  });
+  Promise.all([
+    // fields= trims it to what we use: 1.5 MB down to about 20 KB.
+    get("sports/1/players?season=" + year + "&fields=people,fullName,currentTeam,id"),
+    get("teams?sportId=1&season=" + year + "&fields=teams,id,name"),
+  ]).then(([people, teams]) => {
+    const names = {};
+    for (const t of teams.teams) names[t.id] = t.name;
+    season = people.people
+      .filter((m) => m.currentTeam && names[m.currentTeam.id])
+      .map((m) => ({ name: m.fullName, team: names[m.currentTeam.id] }));
+    seasonState = "";
+  }).catch(() => {
+    seasonState = "failed";                    // tried again on the next Premium change
+  }).then(refresh);
+}
+
+function refresh() {
+  build();
+  render();
 }
 
 let filter = "all";
@@ -354,33 +469,68 @@ function historyFor(p) {
  * Playing a preview
  * ---------------------------------------------------------------------
  * Apple's search will hand back a free 30-second preview for most tracks,
- * but it doesn't allow ordinary cross-site requests — a normal fetch is
- * refused. It does support the older trick of being loaded as a <script>
- * that calls a function we name in the URL, so that's what happens here:
- * we plant a callback, load the script, and it calls us back with the
- * result. Cleaned up either way, including if it never answers.
+ * and Deezer's for most of the rest, but neither allows ordinary
+ * cross-site requests — a normal fetch is refused. Both support the older
+ * trick of being loaded as a <script> that calls a function we name in
+ * the URL, so that's what happens here: we plant a callback, load the
+ * script, and it calls us back with the result. Cleaned up either way,
+ * including if it never answers.
  * ===================================================================== */
 let jsonpN = 0;
-function preview(query, cb) {
+function jsonp(url, cb) {
   const id = "cb" + (++jsonpN);
   const s = document.createElement("script");
   let done = false;
-  const finish = (url) => {
+  const finish = (data) => {
     if (done) return;
     done = true;
     try { delete window[id]; } catch (e) { }
     s.remove();
-    cb(url);
+    cb(data);
   };
-  window[id] = (data) => {
-    const r = data && data.results && data.results[0];
-    finish(r ? r.previewUrl : null);
-  };
+  window[id] = finish;
   s.onerror = () => finish(null);
-  s.src = "https://itunes.apple.com/search?media=music&entity=song&limit=1&callback=" +
-          id + "&term=" + encodeURIComponent(query);
+  s.src = url + "&callback=" + id;
   document.head.appendChild(s);
   setTimeout(() => finish(null), 6000);        // give up if it never answers
+}
+
+// Each hands back a list of { trackName, artistName, previewUrl }.
+function apple(term, cb) {
+  jsonp("https://itunes.apple.com/search?media=music&entity=song&limit=25&term=" + encodeURIComponent(term),
+        (d) => cb((d && d.results) || []));
+}
+function deezer(term, cb) {
+  jsonp("https://api.deezer.com/search?output=jsonp&limit=25&q=" + encodeURIComponent(term),
+        (d) => cb(((d && d.data) || []).map((t) => ({
+          trackName: t.title, artistName: t.artist && t.artist.name, previewUrl: t.preview,
+        }))));
+}
+
+/* Neither's first hit is always the right song ("Solo — Future" turns up
+   Frank Ocean), so ask for a couple of dozen and take the first that is
+   this title by one of these artists. If none is, it says so rather than
+   play somebody else's song. Apple first, with every artist; then Deezer,
+   with just the first one, since its search does worse with a long list. */
+function preview(song, cb) {
+  const parts = song.split(" — ");
+  // "- Remastered 2010", "- Album Version (Edited)": the search does better without.
+  const title = parts[0].replace(/ - .*$/, "");
+  const artists = (parts[1] || "").split(/,|·|&|\/| and | x | feat\.? /i).map(plain).filter(Boolean);
+  const byThem = (r) => artists.some((a) => plain(r.artistName || "").includes(a));
+  // Titles are compared without their (feat. …) / [Remix] bits, which the two sides write differently.
+  const core = (t) => plain(t.replace(/[([].*?[)\]]/g, "")) || plain(t);
+  const named = (r) => { const t = core(r.trackName || ""), c = core(title); return t.includes(c) || c.includes(t); };
+  const ours = (r) => r.previewUrl && named(r) && (!artists.length || byThem(r));
+
+  apple(title + " " + (parts[1] || ""), (rs) => {
+    const hit = rs.find(ours);
+    if (hit) return cb(hit.previewUrl);
+    deezer(title + " " + (parts[1] || "").split(/,|·|&/)[0], (more) => {
+      const again = more.find(ours);
+      cb(again ? again.previewUrl : null);
+    });
+  });
 }
 
 let audio = null;
@@ -419,17 +569,32 @@ function clearClock() {
   $("prog").style.width = "0%";
 }
 
+const found = new Map();                       // song -> preview URL, once looked up
+
+// A twentieth of a second of silence, to start the player during the tap.
+const SILENCE = "data:audio/wav;base64,UklGRogAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YWQAAACAgICAgICAgICAgICAgICAgICAgICAgICAgICA" +
+                "gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA";
+
 function start(p) {
   const wanted = ++seq;
   nowPlaying = p.name;
   $("bar").hidden = false;
   $("nowT").textContent = p.song;
-  $("nowW").textContent = p.name + " · finding it…";
   clearClock();                                // no stale time from the last song
+  if (!audio) audio = new Audio();
+
+  // Looked up before, so it can start right here inside the tap.
+  if (found.has(p.song)) {
+    play(p, found.get(p.song));
+    render();
+    return;
+  }
+
+  $("nowW").textContent = p.name + " · finding it…";
+  unlock();
   render();
 
-  // The em dash is ours, not part of the title — the search does better without it.
-  preview(p.song.replace(/ — /g, " "), (url) => {
+  preview(p.song, (url) => {
     if (wanted !== seq) return;                // you clicked something else meanwhile
     if (!url) {
       $("nowW").textContent = p.name + " · no preview found for this one";
@@ -437,17 +602,51 @@ function start(p) {
       render();
       return;
     }
-    if (!audio) audio = new Audio();
-    audio.src = url;
-    audio.volume = 0.8;
-    audio.onended = stop;
-    // timeupdate fires a few times a second while playing; loadedmetadata is
-    // what first tells us how long the preview actually is.
-    audio.ontimeupdate = tick;
-    audio.onloadedmetadata = tick;
-    const go = audio.play();
-    if (go && go.catch) go.catch(() => { $("nowW").textContent = p.name + " · tap play again"; });
-    $("nowW").textContent = p.name + " · 30 second preview";
+    found.set(p.song, url);
+    play(p, url);
+  });
+}
+
+/* Safari only lets a player start sound from inside a tap, but once a
+   player has been started that way it can go on to play anything. So the
+   tap plays the silence, and the preview goes onto the same player later.
+   The handlers come off first so the silence ending doesn't count as the
+   song ending. */
+function unlock() {
+  audio.onended = audio.ontimeupdate = audio.onloadedmetadata = audio.onerror = null;
+  audio.src = SILENCE;
+  const go = audio.play();
+  if (go && go.catch) go.catch(() => { });     // swapped for the real thing anyway
+}
+
+function play(p, url) {
+  const wanted = seq;
+  audio.src = url;
+  audio.volume = 0.8;
+  audio.onended = stop;
+  // timeupdate fires a few times a second while playing; loadedmetadata is
+  // what first tells us how long the preview actually is.
+  audio.ontimeupdate = tick;
+  audio.onloadedmetadata = tick;
+  // Deezer's links expire after a while, so a saved one can go stale.
+  // Forget it, and the next ▶ looks it up fresh.
+  audio.onerror = () => {
+    if (wanted !== seq) return;
+    found.delete(p.song);
+    $("nowW").textContent = p.name + " · couldn't load it, tap ▶ to try again";
+    nowPlaying = null;
+    clearClock();
+    render();
+  };
+  $("nowW").textContent = p.name + " · 30 second preview";
+  const go = audio.play();
+  // If the browser still says no, the preview is saved now, so ▶ plays it
+  // straight from the tap. Its ▶ goes back to ▶ (not ■) so the tap does that.
+  if (go && go.catch) go.catch(() => {
+    if (wanted !== seq) return;                // stopped, or moved on to another
+    $("nowW").textContent = p.name + " · tap ▶ to play";
+    nowPlaying = null;
+    render();
   });
 }
 
@@ -471,7 +670,18 @@ document.querySelectorAll("[data-filter]").forEach((b) => {
   };
 });
 
-render();
+/* Premium can start or end while the page is open: bought or turned off
+   in the store at the bottom (the shared script announces that), or in
+   another tab of the arcade (which the browser announces). */
+function premiumChanged() {
+  loadSeason();
+  refresh();
+}
+window.addEventListener("arcade-premium-change", premiumChanged);
+window.addEventListener("storage", premiumChanged);
+
+loadSeason();
+refresh();
 </script>
 <!-- App Arcade ads + clock + store (shared, from github.com/cmadisons/app-arcade) -->
 <script src="https://cmadisons.github.io/app-arcade/app-ads.js" data-app="walkup" defer></script>
