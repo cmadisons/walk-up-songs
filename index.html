@@ -661,6 +661,18 @@ function stop() {
 
 $("stop").onclick = stop;
 $("q").oninput = render;
+
+/* Arrive with ?q=Name and the page opens already searched for that player.
+   The baseball app links here from the song line under whoever is at bat,
+   and dropping somebody at the top of an 800-name list to find the name
+   again themselves is not much of a link. */
+(function openSearched() {
+  const wanted = new URLSearchParams(location.search).get("q");
+  if (!wanted) return;
+  const box = $("q");
+  if (!box) return;
+  box.value = wanted;
+})();
 $("team").onchange = render;
 document.querySelectorAll("[data-filter]").forEach((b) => {
   b.onclick = () => {
